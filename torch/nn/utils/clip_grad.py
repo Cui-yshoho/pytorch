@@ -110,24 +110,51 @@ def _get_total_norm(
         [tensors]  # type: ignore[list-item]
     )  # type: ignore[assignment]
 
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+
     norms: list[Tensor] = []
+    debug_detail_lines: list[str] = []
+    local_total_p = torch.tensor(0.0, device=first_device, dtype=torch.float32)
     for (device, _), ([device_tensors], _) in grouped_tensors.items():
         if (foreach is None and _has_foreach_support(device_tensors, device)) or (
             foreach and _device_has_foreach_support(device)
         ):
-            norms.extend(torch._foreach_norm(device_tensors, norm_type))
+            device_norms = torch._foreach_norm(device_tensors, norm_type)
         elif foreach:
             raise RuntimeError(
                 f"foreach=True was passed, but can't use the foreach API on {device.type} tensors"
             )
         else:
-            norms.extend(
-                [torch.linalg.vector_norm(g, norm_type) for g in device_tensors]
+            device_norms = [
+                torch.linalg.vector_norm(g, norm_type) for g in device_tensors
+            ]
+        norms.extend(device_norms)
+        if rank == 0:
+            combined = torch.linalg.vector_norm(
+                torch.stack([norm.to(first_device) for norm in device_norms]), norm_type
+            )
+            combined_p = combined.to(torch.float32) ** norm_type
+            local_total_p.add_(combined_p)
+            debug_detail_lines.append(
+                f"device={device}, dtype={device_tensors[0].dtype}, "
+                f"num_tensors={len(device_tensors)}, "
+                f"combined={combined.item():.10f}, combined_p={combined_p.item():.10f}"
             )
 
     total_norm = torch.linalg.vector_norm(
         torch.stack([norm.to(first_device) for norm in norms]), norm_type
     )
+    if rank == 0:
+        print(
+            f"[TORCH_NORM_LOCAL] local_combined={total_norm.item():.10f}, "
+            f"local_total_p={local_total_p.item():.10f}",
+            flush=True,
+        )
+        for detail in debug_detail_lines:
+            print(f"[TORCH_NORM_DETAIL] {detail}", flush=True)
 
     if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
         raise RuntimeError(
