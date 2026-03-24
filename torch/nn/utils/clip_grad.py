@@ -43,6 +43,17 @@ def _debug_tensor_meta(tensor: torch.Tensor) -> str:
     return f"type={tensor_type}, dtype={dtype}, device={device}, placements={placements}"
 
 
+def _debug_scalar_local_value(tensor: torch.Tensor) -> object:
+    if hasattr(tensor, "_local_tensor"):
+        local_tensor = tensor._local_tensor  # type: ignore[attr-defined]
+        if local_tensor.numel() == 1:
+            return local_tensor.item()
+        return f"local_shape={tuple(local_tensor.shape)}"
+    if tensor.numel() == 1:
+        return tensor.item()
+    return f"shape={tuple(tensor.shape)}"
+
+
 def _no_grad(func):
     """
     This wrapper is needed to avoid a circular import when using @torch.no_grad on the exposed functions
@@ -260,15 +271,13 @@ def clip_grad_norm_(
     total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
     if rank == 0:
         clip_coef = max_norm / (total_norm + 1e-6)
-        local_norm = None
-        if hasattr(total_norm, "_local_tensor"):
-            local_norm = total_norm._local_tensor  # type: ignore[attr-defined]
+        local_norm = _debug_scalar_local_value(total_norm)
         print(
             "[TORCH_CLIP_NORM] "
             f"total_norm_meta={_debug_tensor_meta(total_norm)}, "
-            f"total_norm_value={total_norm}, "
             f"local_total_norm={local_norm}, "
-            f"clip_coef={clip_coef}",
+            f"clip_coef_meta={_debug_tensor_meta(clip_coef)}, "
+            f"clip_coef_local={_debug_scalar_local_value(clip_coef)}",
             flush=True,
         )
     _clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
