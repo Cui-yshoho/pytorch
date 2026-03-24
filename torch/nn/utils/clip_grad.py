@@ -54,6 +54,15 @@ def _debug_scalar_local_value(tensor: torch.Tensor) -> object:
     return f"shape={tuple(tensor.shape)}"
 
 
+def _debug_grad_abs_sum(grads: typing.Iterable[torch.Tensor]) -> Optional[float]:
+    total: Optional[torch.Tensor] = None
+    for grad in grads:
+        local_grad = grad._local_tensor if hasattr(grad, "_local_tensor") else grad  # type: ignore[attr-defined]
+        abs_sum = local_grad.detach().abs().sum(dtype=torch.float32)
+        total = abs_sum if total is None else total + abs_sum
+    return None if total is None else float(total.item())
+
+
 def _no_grad(func):
     """
     This wrapper is needed to avoid a circular import when using @torch.no_grad on the exposed functions
@@ -211,6 +220,7 @@ def _clip_grads_with_norm_(
     )  # type: ignore[assignment]
 
     clip_coef = max_norm / (total_norm + 1e-6)
+    debug_pre_abs_sum = _debug_grad_abs_sum(grads)
     # Note: multiplying by the clamped coef is redundant when the coef is clamped to 1, but doing so
     # avoids a `if clip_coef < 1:` conditional which can require a CPU <=> device synchronization
     # when the gradients do not reside in CPU memory.
@@ -228,6 +238,20 @@ def _clip_grads_with_norm_(
             clip_coef_clamped_device = clip_coef_clamped.to(device)
             for g in device_grads:
                 g.mul_(clip_coef_clamped_device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+    if rank == 0:
+        print(
+            "[TORCH_CLIP_APPLY] "
+            f"clip_coef_local={_debug_scalar_local_value(clip_coef)}, "
+            f"clip_coef_clamped_local={_debug_scalar_local_value(clip_coef_clamped)}, "
+            f"pre_abs_sum={debug_pre_abs_sum}, "
+            f"post_abs_sum={_debug_grad_abs_sum(grads)}, "
+            f"num_grads={len(grads)}",
+            flush=True,
+        )
 
 
 @_no_grad
