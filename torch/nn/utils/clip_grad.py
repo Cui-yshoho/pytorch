@@ -2,6 +2,7 @@
 # mypy: allow-untyped-defs
 import functools
 import typing
+from collections import defaultdict
 from typing import cast, Optional, Union
 from typing_extensions import deprecated
 
@@ -25,6 +26,21 @@ _tensor_or_tensors = Union[
     torch.Tensor,
     typing.Iterable[torch.Tensor],  # noqa: UP006 - needed until XLA's patch is updated
 ]
+
+
+def _debug_tensor_meta(tensor: torch.Tensor) -> str:
+    tensor_type = type(tensor).__name__
+    dtype = getattr(tensor, "dtype", "N/A")
+    device = getattr(tensor, "device", "N/A")
+    placements = getattr(tensor, "placements", None)
+    if hasattr(tensor, "_local_tensor"):
+        local_tensor = tensor._local_tensor  # type: ignore[attr-defined]
+        return (
+            f"type={tensor_type}, dtype={dtype}, device={device}, "
+            f"local_dtype={local_tensor.dtype}, local_device={local_tensor.device}, "
+            f"placements={placements}"
+        )
+    return f"type={tensor_type}, dtype={dtype}, device={device}, placements={placements}"
 
 
 def _no_grad(func):
@@ -216,7 +232,45 @@ def clip_grad_norm_(
         # prevent generators from being exhausted
         parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+    if rank == 0:
+        grad_type_counts: dict[str, int] = defaultdict(int)
+        grad_dtype_counts: dict[str, int] = defaultdict(int)
+        local_grad_dtype_counts: dict[str, int] = defaultdict(int)
+        grad_placement_counts: dict[str, int] = defaultdict(int)
+        for grad in grads:
+            grad_type_counts[type(grad).__name__] += 1
+            grad_dtype_counts[str(getattr(grad, "dtype", "N/A"))] += 1
+            placements = getattr(grad, "placements", None)
+            grad_placement_counts[str(placements)] += 1
+            if hasattr(grad, "_local_tensor"):
+                local_grad_dtype_counts[str(grad._local_tensor.dtype)] += 1  # type: ignore[attr-defined]
+        print(
+            "[TORCH_CLIP_INPUT] "
+            f"num_params={len(parameters)}, num_grads={len(grads)}, "
+            f"grad_types={dict(grad_type_counts)}, grad_dtypes={dict(grad_dtype_counts)}, "
+            f"local_grad_dtypes={dict(local_grad_dtype_counts)}, placements={dict(grad_placement_counts)}",
+            flush=True,
+        )
+        if grads:
+            print(f"[TORCH_CLIP_INPUT_SAMPLE] {_debug_tensor_meta(grads[0])}", flush=True)
     total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
+    if rank == 0:
+        clip_coef = max_norm / (total_norm + 1e-6)
+        local_norm = None
+        if hasattr(total_norm, "_local_tensor"):
+            local_norm = total_norm._local_tensor  # type: ignore[attr-defined]
+        print(
+            "[TORCH_CLIP_NORM] "
+            f"total_norm_meta={_debug_tensor_meta(total_norm)}, "
+            f"total_norm_value={total_norm}, "
+            f"local_total_norm={local_norm}, "
+            f"clip_coef={clip_coef}",
+            flush=True,
+        )
     _clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
     return total_norm
 

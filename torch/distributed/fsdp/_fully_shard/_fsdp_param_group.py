@@ -414,6 +414,18 @@ class FSDPParamGroup:
         if len(fsdp_params_with_grad) == 0:
             return
         with record_function(self._with_fqn("FSDP::post_backward_reduce")):
+            if dist.is_available() and dist.is_initialized() and dist.get_rank() == 0:
+                unsharded_grad_dtypes: dict[str, int] = {}
+                for grad in unsharded_grads:
+                    key = str(grad.dtype)
+                    unsharded_grad_dtypes[key] = unsharded_grad_dtypes.get(key, 0) + 1
+                print(
+                    "[TORCH_FSDP_PRE_REDUCE] "
+                    f"num_fsdp_params_with_grad={len(fsdp_params_with_grad)}, "
+                    f"orig_dtype={self._orig_dtype}, reduce_dtype={self._reduce_dtype}, "
+                    f"unsharded_grad_dtypes={unsharded_grad_dtypes}",
+                    flush=True,
+                )
             if self.comm_ctx.reduce_scatter_state is not None:
                 self.device_handle.current_stream().wait_event(
                     self.comm_ctx.reduce_scatter_state.event
